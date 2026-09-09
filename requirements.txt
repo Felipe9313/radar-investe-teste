@@ -1,0 +1,7 @@
+transferegovpy==0.2.0
+fastapi
+uvicorn
+jinja2
+python-multipart
+requests
+beautifulsoup4
