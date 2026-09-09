@@ -2515,8 +2515,14 @@ def _set_config(chave, valor):
         conn.commit()
 
 
+ATUALIZACAO_LOCK = threading.Lock()
+
+
 def executar_atualizacao_background():
-    """Executa a coleta fora da requisição HTTP."""
+    """Executa a coleta fora da requisição HTTP, uma por vez."""
+    if not ATUALIZACAO_LOCK.acquire(blocking=False):
+        return
+
     try:
         _set_config("atualizacao_status", "executando")
         _set_config(
@@ -2548,37 +2554,13 @@ def executar_atualizacao_background():
         )
         print("ERRO ATUALIZAÇÃO BACKGROUND:", type(e).__name__, e)
 
+    finally:
+        ATUALIZACAO_LOCK.release()
+
 
 def iniciar_agendador_producao():
-    """
-    No Railway, faz uma atualização pouco depois de subir
-    e repete a cada 6 horas.
-    """
-    if not os.getenv("PORT"):
-        return
-
-    if os.getenv("ATIVAR_AGENDADOR", "1") != "1":
-        return
-
-    def loop():
-        # Dá tempo para a aplicação concluir o startup.
-        time.sleep(20)
-
-        while True:
-            try:
-                executar_atualizacao_background()
-            except Exception as e:
-                print("ERRO AGENDADOR:", type(e).__name__, e)
-
-            # 6 horas
-            time.sleep(6 * 60 * 60)
-
-    thread = threading.Thread(
-        target=loop,
-        name="radar-agendador",
-        daemon=True,
-    )
-    thread.start()
+    """Desativado no Railway de teste. Atualização é manual."""
+    return
 
 
 # ============================================================
@@ -2919,10 +2901,6 @@ def listar_fontes_estrategicas():
 # HOME
 # ============================================================
 
-
-@app.on_event("startup")
-def _startup_radar():
-    iniciar_agendador_producao()
 
 
 @app.get("/", response_class=HTMLResponse)
