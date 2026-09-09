@@ -1,4 +1,7 @@
 import os
+import json
+import threading
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 import hashlib
@@ -14,7 +17,7 @@ try:
     import transferegovpy as tg
 except Exception:
     tg = None
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, Form, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -2498,6 +2501,86 @@ def atualizar_fontes():
     return resultado
 
 
+def _set_config(chave, valor):
+    with conexao() as conn:
+        conn.execute(
+            """
+            INSERT INTO radar_config (chave, valor)
+            VALUES (?, ?)
+            ON CONFLICT(chave)
+            DO UPDATE SET valor = excluded.valor
+            """,
+            (chave, str(valor)),
+        )
+        conn.commit()
+
+
+def executar_atualizacao_background():
+    """Executa a coleta fora da requisição HTTP."""
+    try:
+        _set_config("atualizacao_status", "executando")
+        _set_config(
+            "atualizacao_inicio",
+            datetime.now().isoformat(timespec="seconds"),
+        )
+
+        resultado = atualizar_fontes()
+
+        _set_config(
+            "atualizacao_ultimo_resultado",
+            json.dumps(resultado, ensure_ascii=False),
+        )
+        _set_config("atualizacao_status", "concluida")
+        _set_config(
+            "atualizacao_fim",
+            datetime.now().isoformat(timespec="seconds"),
+        )
+
+    except Exception as e:
+        _set_config("atualizacao_status", "erro")
+        _set_config(
+            "atualizacao_erro",
+            f"{type(e).__name__}: {e}",
+        )
+        _set_config(
+            "atualizacao_fim",
+            datetime.now().isoformat(timespec="seconds"),
+        )
+        print("ERRO ATUALIZAÇÃO BACKGROUND:", type(e).__name__, e)
+
+
+def iniciar_agendador_producao():
+    """
+    No Railway, faz uma atualização pouco depois de subir
+    e repete a cada 6 horas.
+    """
+    if not os.getenv("PORT"):
+        return
+
+    if os.getenv("ATIVAR_AGENDADOR", "1") != "1":
+        return
+
+    def loop():
+        # Dá tempo para a aplicação concluir o startup.
+        time.sleep(20)
+
+        while True:
+            try:
+                executar_atualizacao_background()
+            except Exception as e:
+                print("ERRO AGENDADOR:", type(e).__name__, e)
+
+            # 6 horas
+            time.sleep(6 * 60 * 60)
+
+    thread = threading.Thread(
+        target=loop,
+        name="radar-agendador",
+        daemon=True,
+    )
+    thread.start()
+
+
 # ============================================================
 # PROJETOS MUNICIPAIS E COMPATIBILIDADE
 # ============================================================
@@ -2835,6 +2918,12 @@ def listar_fontes_estrategicas():
 # ============================================================
 # HOME
 # ============================================================
+
+
+@app.on_event("startup")
+def _startup_radar():
+    iniciar_agendador_producao()
+
 
 @app.get("/", response_class=HTMLResponse)
 def home(
@@ -3452,29 +3541,11 @@ def pesquisa(
 # ============================================================
 
 @app.post("/atualizar")
-def atualizar():
-    resultado = atualizar_fontes()
-
-    partes = [
-        (
-            "Atualização concluída: "
-            f"{resultado['incluidas_ou_atualizadas']} oportunidades lidas."
-        )
-    ]
-
-    for fonte, qtd in resultado["fontes"].items():
-        if fonte == "Transferegov":
-            partes.append("Transferegov: consulta oficial")
-        else:
-            partes.append(f"{fonte}: {qtd}")
-
-    if resultado["erros"]:
-        partes.append("Alguma fonte apresentou erro; veja o terminal.")
-
-    msg = " | ".join(partes)
+def atualizar(background_tasks: BackgroundTasks):
+    background_tasks.add_task(executar_atualizacao_background)
 
     return RedirectResponse(
-        url="/?msg=" + requests.utils.quote(msg),
+        url="/?msg=Atualização+iniciada+em+segundo+plano.+Aguarde+alguns+minutos+e+atualize+a+página.",
         status_code=303,
     )
 
@@ -3727,5 +3798,46 @@ def api_oportunidades():
 
 
 @app.get("/api/atualizar")
-def api_atualizar():
-    return atualizar_fontes()
+def api_atualizar(background_tasks: BackgroundTasks):
+    background_tasks.add_task(executar_atualizacao_background)
+
+    return {
+        "status": "iniciada",
+        "mensagem": (
+            "A atualização está rodando em segundo plano. "
+            "Consulte /api/status-atualizacao para acompanhar."
+        ),
+    }
+
+
+@app.get("/api/status-atualizacao")
+def api_status_atualizacao():
+    chaves = [
+        "atualizacao_status",
+        "atualizacao_inicio",
+        "atualizacao_fim",
+        "atualizacao_erro",
+        "atualizacao_ultimo_resultado",
+        "ultima_atualizacao",
+    ]
+
+    with conexao() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT chave, valor
+            FROM radar_config
+            WHERE chave IN ({",".join("?" for _ in chaves)})
+            """,
+            chaves,
+        ).fetchall()
+
+    dados = {row["chave"]: row["valor"] for row in rows}
+
+    ultimo = dados.get("atualizacao_ultimo_resultado")
+    if ultimo:
+        try:
+            dados["atualizacao_ultimo_resultado"] = json.loads(ultimo)
+        except Exception:
+            pass
+
+    return dados
